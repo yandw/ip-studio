@@ -111,8 +111,20 @@ const MIME = {
   '.json': 'application/json; charset=utf-8',
 };
 
-const server = createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+const server = createServer((req, res) => {
+  // node:http 不会接住 async 回调的 rejection，所有入口都要有异常边界。
+  handleRequest(req, res).catch((err) => {
+    const status = err instanceof HttpError ? err.status : 500;
+    if (status >= 500) console.error('[http]', err);
+    if (res.headersSent) { res.end(); return; }
+    R.json(res, status, { error: R.describe(err) });
+  });
+});
+
+async function handleRequest(req, res) {
+  let url;
+  try { url = new URL(req.url, `http://${req.headers.host || 'localhost'}`); }
+  catch { throw new HttpError(400, '请求地址不合法'); }
   const path = url.pathname;
 
   if (path.startsWith('/image/')) {
@@ -150,7 +162,7 @@ const server = createServer(async (req, res) => {
   }
 
   await serveStatic(path, res);
-});
+}
 
 async function readJSON(req) {
   const chunks = [];
@@ -178,7 +190,9 @@ async function serveOwned(path, prefix, dir, req, res) {
   const user = currentUser(req);
   if (!user) { res.writeHead(401).end('Unauthorized'); return; }
 
-  const rel = decodeURIComponent(path.slice(prefix.length));   // 查询串已被 URL 解析剥掉
+  let rel;
+  try { rel = decodeURIComponent(path.slice(prefix.length)); }
+  catch { throw new HttpError(400, '媒体路径编码不合法'); }
   const [owner, name] = rel.split('/');
   if (String(owner) !== String(user.id) || !/^[\w.-]+$/.test(name || '')) {
     res.writeHead(403).end('Forbidden');

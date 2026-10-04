@@ -14,7 +14,7 @@ import { PROVIDER, generateJSON, generateText, providerInfo, streamText } from '
 import { ASSEMBLY, PRINCIPLE, PROMPT_DOCS, STAGES } from './promptdocs.js';
 import { costOf, loadPricing, priceOf } from './pricing.js';
 import { pickVariant, scoreText, scoreTopics, summarize } from './abtest.js';
-import { QuotaError, assertQuota, consume, snapshot } from './quota.js';
+import { QuotaError, reserveQuota, snapshot } from './quota.js';
 import { PACKS, PLANS, creditsFor, explain, planOf } from './plans.js';
 import { createPayment, newTradeNo, payInfo, queryOrder, verifyNotify } from './pay.js';
 import { conf, save as saveSetting, status as settingsStatus } from './settings.js';
@@ -784,12 +784,11 @@ export async function handleContent(req, res, body, params) {
 
   const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   const controller = new AbortController();
-  req.on('close', () => controller.abort());
+  const onClose = () => controller.abort();
+  res.on('close', onClose);
 
   send('start', { title: topic.title });
-  Drafts.setContent(draft.id, user.id, {
-    chosen: index, title: topic.title, content: '', status: 'writing',
-  });
+  // 旧稿保留到新正文完整生成；失败或断开连接都不能毁掉已保存的内容。
 
   try {
     const content = await streamText({
@@ -800,6 +799,7 @@ export async function handleContent(req, res, body, params) {
       mock: () => mockContent(draft, topic),
       signal: controller.signal,
     });
+    controller.signal.throwIfAborted();
     Drafts.setContent(draft.id, user.id, {
       chosen: index, title: topic.title, content, status: 'done',
     });
@@ -807,6 +807,7 @@ export async function handleContent(req, res, body, params) {
   } catch (err) {
     if (!controller.signal.aborted) send('error', { message: describe(err) });
   } finally {
+    res.off('close', onClose);
     res.end();
   }
 }
@@ -1417,7 +1418,7 @@ export async function handleIllusImage(req, res, body, params) {
   if (!item.prompt) throw new HttpError(400, '这一张还没有画面提示词');
 
   const info = imageInfo();
-  assertQuota(user.id, '图文配图', 1);
+  const reservation = reserveQuota(user.id, '图文配图', 1);
   const prompt = store.look ? `${item.prompt}。整体风格：${store.look}` : item.prompt;
   const started = Date.now();
   let out;
@@ -1428,8 +1429,9 @@ export async function handleIllusImage(req, res, body, params) {
       userId: user.id, feature: '图文配图', provider: info.provider, model: info.model,
       ok: true, ms: Date.now() - started, units: 1, unit: '张',
     });
-    consume(user.id, '图文配图', 1);
+    reservation.settle(1);
   } catch (err) {
+    reservation.release();
     Usage.record({
       userId: user.id, feature: '图文配图', provider: info.provider, model: info.model,
       ok: false, ms: Date.now() - started, error: String(err?.message || err),

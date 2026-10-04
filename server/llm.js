@@ -1,4 +1,4 @@
-import { assertQuota, consume } from './quota.js';
+import { reserveQuota } from './quota.js';
 /* 大模型接入层
  *   anthropic —— 官方 SDK（默认 claude-opus-5），结构化输出 + 流式正文
  *   openai    —— 任意 OpenAI 兼容接口（DeepSeek / Kimi / 通义 / vLLM / Ollama）
@@ -48,7 +48,7 @@ async function tracked(meta, run) {
   const started = Date.now();
   const model = PROVIDER === 'anthropic' ? ANTHROPIC_MODEL : PROVIDER === 'openai' ? OPENAI_MODEL : 'mock';
   const metered = meta.userId && !String(meta.feature || '').startsWith('eval');
-  if (metered) assertQuota(meta.userId, '文案');
+  const reservation = metered ? reserveQuota(meta.userId, '文案') : null;
   try {
     const { value, usage } = await run();
     const tokens = (usage?.input || 0) + (usage?.output || 0);
@@ -57,9 +57,10 @@ async function tracked(meta, run) {
       inputTokens: usage?.input || 0, outputTokens: usage?.output || 0,
       units: tokens, unit: 'token',
     });
-    if (metered) consume(meta.userId, '文案', tokens);
+    reservation?.settle(tokens);
     return value;
   } catch (err) {
+    reservation?.release();
     usageSink?.({
       ...meta, provider: PROVIDER, model, ok: false, ms: Date.now() - started,
       error: String(err?.message || err),
@@ -206,24 +207,37 @@ async function openaiChat({ system, user, stream, onDelta, responseFormat, signa
   let full = '';
   let buf = '';
   let usage = null;
+  let done = false;
+  let finished = false;
   const decoder = new TextDecoder();
+  const readLine = (line) => {
+    if (!line.startsWith('data:')) return;
+    const payload = line.slice(5).trim();
+    if (!payload) return;
+    if (payload === '[DONE]') { done = true; return; }
+    let chunk;
+    try { chunk = JSON.parse(payload); }
+    catch { throw new Error('上游流式接口返回了无法解析的数据'); }
+    if (chunk.error) throw new Error(`上游流式接口返回错误：${String(chunk.error.message || chunk.error).slice(0, 200)}`);
+    const choice = chunk.choices?.[0];
+    if (choice?.finish_reason) {
+      if (choice.finish_reason !== 'stop') throw new Error(`上游生成未完成（${choice.finish_reason}）`);
+      finished = true;
+    }
+    const delta = choice?.delta?.content;
+    if (delta) { full += delta; onDelta?.(delta); }
+    if (chunk.usage) usage = { input: chunk.usage.prompt_tokens, output: chunk.usage.completion_tokens };
+  };
   for await (const chunk of res.body) {
     buf += decoder.decode(chunk, { stream: true });
     const lines = buf.split('\n');
     buf = lines.pop() || '';
-    for (const line of lines) {
-      if (!line.startsWith('data:')) continue;
-      const payload = line.slice(5).trim();
-      if (!payload || payload === '[DONE]') continue;
-      try {
-        const chunk = JSON.parse(payload);
-        const delta = chunk.choices?.[0]?.delta?.content;
-        if (delta) { full += delta; onDelta?.(delta); }
-        // 开了 include_usage 之后，用量在最后一个 chunk 里
-        if (chunk.usage) usage = { input: chunk.usage.prompt_tokens, output: chunk.usage.completion_tokens };
-      } catch { /* 忽略心跳等非 JSON 行 */ }
-    }
+    for (const line of lines) readLine(line);
   }
+  // 兼容没有末尾换行的最后一个事件，并刷新 TextDecoder 的尾部缓冲。
+  readLine(buf + decoder.decode());
+  if (!done && !finished) throw new Error('上游流式输出中断，请重试');
+  if (!full.trim()) throw new Error('上游没有返回正文');
   return { text: full, usage };
 }
 
@@ -243,9 +257,10 @@ export function parseJSON(text) {
 
 async function streamMock(text, onDelta, signal) {
   for (let i = 0; i < text.length; i += 12) {
-    if (signal?.aborted) break;
+    signal?.throwIfAborted();
     onDelta(text.slice(i, i + 12));
     await new Promise((r) => setTimeout(r, 18));
   }
+  signal?.throwIfAborted();
   return text;
 }

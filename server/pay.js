@@ -13,7 +13,7 @@
  *   4. 回调可能丢——必须能主动查单补偿，不能只等推送
  */
 
-import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createDecipheriv, createHmac, createSign, createVerify, randomUUID, timingSafeEqual } from 'node:crypto';
 import { conf } from './settings.js';
 
 /* 配置走 conf()：环境变量优先，后台填的存加密库里兜底。
@@ -103,8 +103,6 @@ function wechatAuth(c, method, url, bodyStr) {
   const nonce = randomUUID().replace(/-/g, '');
   const message = `${method}\n${url}\n${ts}\n${nonce}\n${bodyStr}\n`;
   // 商户私钥是 RSA，这里用 node:crypto 的 sign；私钥从环境变量读
-  // eslint-disable-next-line global-require
-  const { createSign } = require('node:crypto');
   const signature = createSign('RSA-SHA256').update(message).end().sign(c.wx.privateKey, 'base64');
   return `WECHATPAY2-SHA256-RSA2048 mchid="${c.wx.mchid}",nonce_str="${nonce}",`
     + `signature="${signature}",timestamp="${ts}",serial_no="${c.wx.serial}"`;
@@ -125,7 +123,6 @@ async function alipayFace(c, { no, amount, subject }) {
       out_trade_no: no, total_amount: (amount / 100).toFixed(2), subject,
     }),
   };
-  const { createSign } = await import('node:crypto');
   const base = Object.keys(params).sort().map((k) => `${k}=${params[k]}`).join('&');
   params.sign = createSign('RSA-SHA256').update(base, 'utf8').end().sign(c.ali.privateKey, 'base64');
 
@@ -172,7 +169,6 @@ function decodeWechat(c, headers, rawBody) {
   try {
     const body = JSON.parse(rawBody);
     const r = body.resource;
-    const { createDecipheriv } = require('node:crypto');
     const d = createDecipheriv('aes-256-gcm', c.wx.key, r.nonce);
     d.setAuthTag(Buffer.from(r.ciphertext, 'base64').subarray(-16));
     d.setAAD(Buffer.from(r.associated_data || ''));
@@ -189,7 +185,6 @@ function decodeWechat(c, headers, rawBody) {
 function decodeAlipay(c, rawBody) {
   try {
     const p = Object.fromEntries(new URLSearchParams(rawBody));
-    const { createVerify } = require('node:crypto');
     const sign = p.sign;
     delete p.sign; delete p.sign_type;
     const base = Object.keys(p).sort().map((k) => `${k}=${p[k]}`).join('&');

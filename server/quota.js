@@ -4,8 +4,8 @@
  * 事后统计只能告诉你"已经被刷爆了"，拦不住任何东西。
  *
  * 但调用前拿不到真实用量（大模型的 token 数要调完才知道），
- * 所以是"预估拦截 + 实际扣减"：先按保守预估判断够不够，
- * 调完拿真实用量扣。预估偏小不会超支太多——最多超一次调用的量。
+ * 所以是"预估预留 + 实际扣减"：先按保守预估锁住额度，
+ * 调完拿真实用量结算，失败则释放，避免并发请求反复使用同一份余额。
  */
 
 import { Quota } from './db.js';
@@ -16,6 +16,10 @@ const GUESS = {
   文案: 12000,          // token，一次成稿来回的上限量级
   图文配图: 1,
 };
+
+// 当前服务是单个 Node 进程：检查和预留同步完成，没有 await 的竞态窗口。
+// 在途预留只留在内存；进程退出后不会遗留用户无法使用的锁定额度。
+const reserved = new Map();
 
 export class QuotaError extends Error {
   constructor(message, info) {
@@ -30,6 +34,7 @@ export function snapshot(userId) {
   const st = Quota.state(userId, period);
   if (!st) return null;
   const plan = planOf(st.plan);
+  const pending = reserved.get(userId) || 0;
   return {
     plan: plan.key,
     label: plan.label,
@@ -38,7 +43,8 @@ export function snapshot(userId) {
     blocked: plan.blocked,
     total: plan.credits,
     used: st.used,
-    left: Math.max(0, plan.credits - st.used),
+    reserved: pending,
+    left: Math.max(0, plan.credits - st.used - pending),
     period,
   };
 }
@@ -70,8 +76,31 @@ export function assertQuota(userId, feature, units) {
 export function consume(userId, feature, units) {
   const credits = creditsFor(feature, units);
   if (!credits) return 0;
+  Quota.state(userId, periodOf());
   Quota.consume(userId, credits, 0);
   return credits;
+}
+
+/* 在调用上游前预留，成功结算或失败释放。句柄只能结算/释放一次。 */
+export function reserveQuota(userId, feature, units) {
+  const { fromPlan } = assertQuota(userId, feature, units);
+  reserved.set(userId, (reserved.get(userId) || 0) + fromPlan);
+  let active = true;
+  const release = () => {
+    if (!active) return;
+    active = false;
+    const left = (reserved.get(userId) || 0) - fromPlan;
+    if (left > 0) reserved.set(userId, left);
+    else reserved.delete(userId);
+  };
+  return {
+    release,
+    settle(actualUnits) {
+      if (!active) return;
+      consume(userId, feature, actualUnits);
+      release();
+    },
+  };
 }
 
 export { PLANS };

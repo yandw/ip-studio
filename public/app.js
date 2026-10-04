@@ -305,7 +305,9 @@ el.personaList.addEventListener('click', (e) => {
 });
 
 function resetBrief() {
+  flushSave();
   state.draft = null;
+  state.dirty = false;
   goStep(1);
   el.briefForm.reset();
   state.pendingHotspot = null;
@@ -673,7 +675,9 @@ el.newBtn.addEventListener('click', () => {
 
 /* ---------------- 渲染方向 ---------------- */
 function setDraft(draft) {
+  flushSave();
   state.draft = draft;
+  state.dirty = false;
   fillBrief(draft);
   renderTopics(draft);
 
@@ -1216,8 +1220,12 @@ function setMode(mode) {
 
 /* ---------------- 保存 ---------------- */
 let saveTimer;
+let editRevision = 0;
+let pendingSaveCount = 0;
+const saveQueues = new Map();
 
 function markDirty() {
+  editRevision += 1;
   state.dirty = true;
   el.saveState.textContent = '未保存';
   el.saveState.className = 'save-state dirty';
@@ -1227,28 +1235,45 @@ function markDirty() {
 
 async function flushSave() {
   clearTimeout(saveTimer);
-  if (!state.dirty || !state.draft) return;
-  const content = state.draft.content;
+  const target = state.draft;
+  if (!target) return;
+  // 检查、学语气等调用方即使没有新改动，也要等已经发出的保存完成。
+  if (!state.dirty) { await saveQueues.get(target.id); return; }
+  const content = target.content;
+  const revision = editRevision;
   state.dirty = false;
+  pendingSaveCount += 1;
   el.saveState.textContent = '保存中…';
   el.saveState.className = 'save-state';
-  try {
-    const { draft } = await api(`/drafts/${state.draft.id}/content`, { method: 'PUT', body: { content } });
-    state.draft = draft;          // 服务端已把 cues 清掉：正文变了，旧的口播提示就对不上了
-    if (state.mode === 'cue') renderCues(null);
-    el.saveState.textContent = '已保存';
-    el.saveState.className = 'save-state saved';
-    loadHistory();
-  } catch (err) {
-    state.dirty = true;
-    el.saveState.textContent = `保存失败：${err.message}`;
-    el.saveState.className = 'save-state dirty';
-  }
+  const previous = saveQueues.get(target.id) || Promise.resolve();
+  const saving = previous.then(async () => {
+    try {
+      const { draft } = await api(`/drafts/${target.id}/content`, { method: 'PUT', body: { content } });
+      // 等待期间编辑过或换过草稿，响应只代表旧快照，不能替换当前内容。
+      if (state.draft !== target || editRevision !== revision) return;
+      state.draft = draft;
+      if (state.mode === 'cue') renderCues(null);
+      el.saveState.textContent = '已保存';
+      el.saveState.className = 'save-state saved';
+      loadHistory();
+    } catch (err) {
+      if (state.draft !== target) { toast(`上一篇稿件保存失败：${err.message}`); return; }
+      if (editRevision !== revision) return;
+      state.dirty = true;
+      el.saveState.textContent = `保存失败：${err.message}`;
+      el.saveState.className = 'save-state dirty';
+    } finally {
+      pendingSaveCount -= 1;
+      if (saveQueues.get(target.id) === saving) saveQueues.delete(target.id);
+    }
+  });
+  saveQueues.set(target.id, saving);
+  await saving;
 }
 
 el.saveBtn.addEventListener('click', flushSave);
 window.addEventListener('beforeunload', (e) => {
-  if (state.dirty) { e.preventDefault(); e.returnValue = ''; }
+  if (state.dirty || pendingSaveCount) { e.preventDefault(); e.returnValue = ''; }
 });
 
 el.editor.addEventListener('compositionend', () => setTimeout(detectSlash, 0));
